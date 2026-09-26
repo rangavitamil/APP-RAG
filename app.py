@@ -1,277 +1,418 @@
-"""
-RAG Application - Flask entry point.
-
-Endpoints:
-  GET  /                      -> dashboard UI
-  GET  /api/health            -> system status (Gemini, Qdrant, KB stats)
-  POST /api/documents         -> upload + ingest a document
-  GET  /api/documents         -> list documents
-  DELETE /api/documents/<id>  -> delete a document + its vectors
-  POST /api/chat              -> ask a question against the knowledge base
-"""
-
-import logging
 import os
-import sys
-import traceback
-
+import re
+from flask import Flask, render_template, request, jsonify
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from google import genai
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
 load_dotenv()
 
-from flask import Flask, request, render_template
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from config.settings import Config
-from utils.helpers import ok, err, new_id, now_iso
-from utils.file_validation import validate_upload, sanitize_filename, FileValidationError
-from services.document_registry import DocumentRegistry
-from services.gemini_service import GeminiService, GeminiServiceError
-from services.qdrant_service import QdrantService, QdrantServiceError
-from services.document_service import DocumentService, DocumentServiceError
-from services.rag_service import RagService, RagServiceError
-
-# ---------------------------------------------------------------------------
-# Logging (never logs secrets)
-# ---------------------------------------------------------------------------
-os.makedirs(Config.LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(Config.LOG_DIR, "app.log")),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("rag_app")
-
-# ---------------------------------------------------------------------------
-# Flask app
-# ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = Config.MAX_CONTENT_LENGTH
-app.config["SECRET_KEY"] = Config.SECRET_KEY
 
-os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(Config.DATA_DIR, exist_ok=True)
+UPLOAD_FOLDER = "uploads"
+ALLOWED_EXTENSIONS = {"pdf"}
 
-registry = DocumentRegistry(Config.DOCUMENT_REGISTRY_PATH)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
-_config_problems = Config.validate()
-for p in _config_problems:
-    logger.warning("Configuration warning: %s", p)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-gemini_service = None
-qdrant_service = None
-document_service = None
-rag_service = None
-_init_error = None
 
-try:
-    gemini_service = GeminiService(
-        api_key=Config.GEMINI_API_KEY,
-        generation_model=Config.GEMINI_MODEL,
-        embedding_model=Config.GEMINI_EMBEDDING_MODEL,
-        embedding_dimensions=Config.EMBEDDING_DIMENSIONS,
+# Gemini
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    raise ValueError("GEMINI_API_KEY is missing in .env file")
+
+client = genai.Client(api_key=API_KEY)
+
+MODEL_NAME = "gemini-3.1-flash-lite"
+
+
+# --------------------------------------------------
+# GLOBAL RAG DATA
+# --------------------------------------------------
+
+chunks = []
+document_name = ""
+vectorizer = None
+chunk_vectors = None
+
+
+# --------------------------------------------------
+# FILE VALIDATION
+# --------------------------------------------------
+
+def allowed_file(filename):
+    return (
+        "." in filename
+        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
     )
-    qdrant_service = QdrantService(
-        url=Config.QDRANT_URL,
-        api_key=Config.QDRANT_API_KEY,
-        collection_name=Config.QDRANT_COLLECTION_NAME,
-        vector_size=Config.EMBEDDING_DIMENSIONS,
+
+
+# --------------------------------------------------
+# PDF TEXT EXTRACTION
+# --------------------------------------------------
+
+def extract_pdf_text(filepath):
+
+    reader = PdfReader(filepath)
+
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+
+        text = text.strip()
+
+        if text:
+            pages.append(
+                f"[Page {page_number}]\n{text}"
+            )
+
+    return "\n\n".join(pages)
+
+
+# --------------------------------------------------
+# TEXT CLEANING
+# --------------------------------------------------
+
+def clean_text(text):
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+# --------------------------------------------------
+# CHUNKING
+# --------------------------------------------------
+
+def create_chunks(text, chunk_size=1000, overlap=150):
+
+    text = clean_text(text)
+
+    if not text:
+        return []
+
+    result = []
+
+    start = 0
+
+    while start < len(text):
+
+        end = start + chunk_size
+
+        chunk = text[start:end]
+
+        if chunk.strip():
+            result.append(chunk.strip())
+
+        start += chunk_size - overlap
+
+    return result
+
+
+# --------------------------------------------------
+# BUILD TF-IDF INDEX
+# --------------------------------------------------
+
+def build_index():
+
+    global vectorizer
+    global chunk_vectors
+
+    if not chunks:
+        vectorizer = None
+        chunk_vectors = None
+        return
+
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        max_features=5000
     )
-    qdrant_service.ensure_collection()
 
-    document_service = DocumentService(
-        gemini_service, qdrant_service, registry,
-        chunk_size=Config.CHUNK_SIZE, chunk_overlap=Config.CHUNK_OVERLAP,
-    )
-
-    with open(Config.RAG_PROMPT_PATH, "r", encoding="utf-8") as f:
-        _system_prompt = f.read()
-
-    rag_service = RagService(
-        gemini_service, qdrant_service, _system_prompt,
-        top_k=Config.TOP_K, similarity_threshold=Config.SIMILARITY_THRESHOLD,
-    )
-except (GeminiServiceError, QdrantServiceError) as exc:
-    _init_error = str(exc)
-    logger.error("Service initialization failed: %s", exc)
+    chunk_vectors = vectorizer.fit_transform(chunks)
 
 
-# ---------------------------------------------------------------------------
-# Routes: UI
-# ---------------------------------------------------------------------------
-@app.route("/")
-def index():
-    return render_template("index.html")
+# --------------------------------------------------
+# RETRIEVE RELEVANT CHUNKS
+# --------------------------------------------------
+
+def retrieve_chunks(question, top_k=4):
+
+    if not chunks or vectorizer is None:
+        return []
+
+    question_vector = vectorizer.transform([question])
+
+    scores = cosine_similarity(
+        question_vector,
+        chunk_vectors
+    )[0]
+
+    ranked_indexes = scores.argsort()[::-1]
+
+    results = []
+
+    for index in ranked_indexes[:top_k]:
+
+        score = float(scores[index])
+
+        if score > 0:
+            results.append({
+                "text": chunks[index],
+                "score": score,
+                "index": int(index)
+            })
+
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Routes: health
-# ---------------------------------------------------------------------------
-@app.route("/api/health")
-def health():
-    gemini_ok = gemini_service.health_check() if gemini_service else False
-    qdrant_ok = qdrant_service.health_check() if qdrant_service else False
-    stats = registry.stats()
-    return ok({
-        "gemini": {"configured": bool(Config.GEMINI_API_KEY), "connected": gemini_ok,
-                   "model": Config.GEMINI_MODEL},
-        "qdrant": {"connected": qdrant_ok, "collection": Config.QDRANT_COLLECTION_NAME},
-        "knowledge_base": stats,
-        "config_warnings": _config_problems,
-        "init_error": _init_error,
-    })
+# --------------------------------------------------
+# GEMINI ANSWER
+# --------------------------------------------------
 
+def generate_answer(question, retrieved):
 
-def _require_services():
-    if not (gemini_service and qdrant_service and document_service and rag_service):
-        return err(
-            _init_error or "Application services are not configured. Check server logs and .env.",
-            code="SERVICE_UNAVAILABLE", status=503,
+    if not retrieved:
+        return {
+            "answer": "I don't know. The uploaded PDF does not contain enough information to answer this question.",
+            "sources": []
+        }
+
+    context_parts = []
+
+    for item in retrieved:
+        context_parts.append(
+            f"CHUNK {item['index'] + 1}:\n{item['text']}"
         )
-    return None
+
+    context = "\n\n".join(context_parts)
+
+    prompt = f"""
+You are CyberSafe RAG, a cybersecurity document assistant.
+
+Your job is to answer ONLY using the information contained
+in the uploaded document.
+
+IMPORTANT RULES:
+
+1. Do not use outside knowledge.
+2. Do not invent facts.
+3. If the answer cannot be found in the document,
+   say exactly:
+   "I don't know. The uploaded PDF does not contain enough information to answer this question."
+4. Keep the answer clear and useful.
+5. If possible, mention the relevant page number from the context.
+6. Answer the user's question directly.
+7. The user may ask cybersecurity questions, but the uploaded
+   document is the final source of truth.
+
+UPLOADED DOCUMENT:
+{document_name}
+
+DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+
+ANSWER:
+"""
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt
+    )
+
+    answer = response.text.strip()
+
+    return {
+        "answer": answer,
+        "sources": retrieved
+    }
 
 
-# ---------------------------------------------------------------------------
-# Routes: documents
-# ---------------------------------------------------------------------------
-@app.route("/api/documents", methods=["GET"])
-def list_documents():
-    return ok({"documents": registry.list_all()})
+# --------------------------------------------------
+# HOME
+# --------------------------------------------------
 
+@app.route("/")
+def home():
 
-@app.route("/api/documents", methods=["POST"])
-def upload_document():
-    guard = _require_services()
-    if guard:
-        return guard
-
-    file_storage = request.files.get("file")
-    try:
-        ext = validate_upload(file_storage, Config.ALLOWED_EXTENSIONS, Config.MAX_CONTENT_LENGTH)
-    except FileValidationError as exc:
-        return err(str(exc), code="INVALID_FILE", status=400)
-
-    original_filename = file_storage.filename
-    safe_name = sanitize_filename(original_filename)
-    document_id = new_id()
-    stored_name = f"{document_id}_{safe_name}"
-    stored_path = os.path.join(Config.UPLOAD_FOLDER, stored_name)
-
-    # Prevent path traversal: confirm the resolved path stays inside UPLOAD_FOLDER
-    upload_root = os.path.realpath(Config.UPLOAD_FOLDER)
-    resolved_path = os.path.realpath(stored_path)
-    if not resolved_path.startswith(upload_root + os.sep):
-        return err("Invalid filename.", code="INVALID_FILE", status=400)
-
-    file_storage.save(stored_path)
-    size_bytes = os.path.getsize(stored_path)
-
-    registry.create({
-        "id": document_id,
-        "filename": original_filename,
-        "file_type": ext,
-        "size_bytes": size_bytes,
-        "uploaded_at": now_iso(),
-        "status": "uploading",
-        "chunk_count": 0,
-        "error": None,
-        "stored_path": stored_path,
-    })
-
-    try:
-        document_service.process(document_id, stored_path, ext, original_filename)
-    except (DocumentServiceError, GeminiServiceError, QdrantServiceError) as exc:
-        # status/error already recorded on the registry by document_service
-        return err(str(exc), code="INGESTION_FAILED", status=422)
-    except Exception:
-        logger.error("Unhandled ingestion error:\n%s", traceback.format_exc())
-        registry.update(document_id, status="failed", error="Unexpected server error during processing.")
-        return err("Unexpected server error during processing.", code="INTERNAL_ERROR", status=500)
-
-    return ok({"document": registry.get(document_id)}, status=201)
-
-
-@app.route("/api/documents/<document_id>", methods=["DELETE"])
-def delete_document(document_id):
-    guard = _require_services()
-    if guard:
-        return guard
-
-    doc = registry.get(document_id)
-    if not doc:
-        return err("Document not found.", code="NOT_FOUND", status=404)
-
-    try:
-        document_service.delete(document_id, stored_path=doc.get("stored_path"))
-    except QdrantServiceError as exc:
-        return err(str(exc), code="DELETE_FAILED", status=502)
-
-    return ok({"deleted": document_id})
-
-
-# ---------------------------------------------------------------------------
-# Routes: chat
-# ---------------------------------------------------------------------------
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    guard = _require_services()
-    if guard:
-        return guard
-
-    body = request.get_json(silent=True) or {}
-    question = body.get("question", "")
-    history = body.get("history", [])
-    if not isinstance(history, list):
-        history = []
-    # keep history bounded and well-shaped
-    history = [
-        {"role": t.get("role"), "text": t.get("text", "")}
-        for t in history[-10:]
-        if isinstance(t, dict) and t.get("role") in ("user", "assistant", "model")
-    ]
-    for t in history:
-        t["role"] = "user" if t["role"] == "user" else "model"
-
-    try:
-        result = rag_service.answer(question, history=history)
-    except RagServiceError as exc:
-        return err(str(exc), code="INVALID_QUESTION", status=400)
-    except (GeminiServiceError, QdrantServiceError) as exc:
-        return err(str(exc), code="RAG_FAILED", status=502)
-    except Exception:
-        logger.error("Unhandled chat error:\n%s", traceback.format_exc())
-        return err("Unexpected server error while answering.", code="INTERNAL_ERROR", status=500)
-
-    return ok(result)
-
-
-# ---------------------------------------------------------------------------
-# Error handlers
-# ---------------------------------------------------------------------------
-@app.errorhandler(413)
-def too_large(_e):
-    return err(
-        f"File exceeds the maximum upload size of {Config.MAX_UPLOAD_SIZE_MB} MB.",
-        code="FILE_TOO_LARGE", status=413,
+    return render_template(
+        "index.html",
+        document_name=document_name,
+        chunk_count=len(chunks)
     )
 
 
-@app.errorhandler(404)
-def not_found(_e):
-    return err("Not found.", code="NOT_FOUND", status=404)
+# --------------------------------------------------
+# PDF UPLOAD
+# --------------------------------------------------
+
+@app.route("/upload", methods=["POST"])
+def upload_pdf():
+
+    global chunks
+    global document_name
+
+    if "file" not in request.files:
+        return jsonify({
+            "success": False,
+            "message": "No PDF file selected."
+        }), 400
+
+    file = request.files["file"]
+
+    if file.filename == "":
+        return jsonify({
+            "success": False,
+            "message": "Please select a PDF file."
+        }), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({
+            "success": False,
+            "message": "Only PDF files are accepted."
+        }), 400
+
+    filename = secure_filename(file.filename)
+
+    filepath = os.path.join(
+        app.config["UPLOAD_FOLDER"],
+        filename
+    )
+
+    try:
+
+        file.save(filepath)
+
+        text = extract_pdf_text(filepath)
+
+        if not text.strip():
+
+            return jsonify({
+                "success": False,
+                "message": "Could not extract text from this PDF. Try a text-based PDF."
+            }), 400
+
+        new_chunks = create_chunks(text)
+
+        if not new_chunks:
+
+            return jsonify({
+                "success": False,
+                "message": "No readable text was found in the PDF."
+            }), 400
+
+        chunks = new_chunks
+        document_name = filename
+
+        build_index()
+
+        return jsonify({
+            "success": True,
+            "message": "PDF uploaded and indexed successfully!",
+            "filename": filename,
+            "chunks": len(chunks)
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": f"Upload failed: {str(e)}"
+        }), 500
 
 
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error("Unhandled server error: %s", e)
-    return err("Internal server error.", code="INTERNAL_ERROR", status=500)
+# --------------------------------------------------
+# ASK QUESTION
+# --------------------------------------------------
 
+@app.route("/ask", methods=["POST"])
+def ask_question():
+
+    data = request.get_json()
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid request."
+        }), 400
+
+    question = data.get("question", "").strip()
+
+    if not question:
+
+        return jsonify({
+            "success": False,
+            "message": "Please enter a question."
+        }), 400
+
+    if not chunks:
+
+        return jsonify({
+            "success": False,
+            "message": "Please upload a PDF first."
+        }), 400
+
+    try:
+
+        retrieved = retrieve_chunks(
+            question,
+            top_k=4
+        )
+
+        result = generate_answer(
+            question,
+            retrieved
+        )
+
+        return jsonify({
+            "success": True,
+            "answer": result["answer"],
+            "sources": [
+                {
+                    "chunk": item["index"] + 1,
+                    "score": round(item["score"], 3)
+                }
+                for item in result["sources"]
+            ]
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+
+
+# --------------------------------------------------
+# RUN
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    if _init_error:
-        logger.warning("Starting with degraded services: %s", _init_error)
-    app.run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG)
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=True
+    )
