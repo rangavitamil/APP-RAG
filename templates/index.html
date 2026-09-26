@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cortex &mdash; Knowledge Assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="scene">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="22" height="22">
+          <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+          <circle cx="6" cy="8" r="2.4" fill="currentColor" opacity="0.55"/>
+          <circle cx="26" cy="8" r="2.4" fill="currentColor" opacity="0.55"/>
+          <circle cx="6" cy="24" r="2.4" fill="currentColor" opacity="0.55"/>
+          <circle cx="26" cy="24" r="2.4" fill="currentColor" opacity="0.55"/>
+          <line x1="16" y1="16" x2="6" y2="8" stroke="currentColor" stroke-width="1.2" opacity="0.4"/>
+          <line x1="16" y1="16" x2="26" y2="8" stroke="currentColor" stroke-width="1.2" opacity="0.4"/>
+          <line x1="16" y1="16" x2="6" y2="24" stroke="currentColor" stroke-width="1.2" opacity="0.4"/>
+          <line x1="16" y1="16" x2="26" y2="24" stroke="currentColor" stroke-width="1.2" opacity="0.4"/>
+        </svg>
+      </span>
+      <span class="brand-name">Cortex</span>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Panels">
+      <button class="tab-btn active" data-panel="documents" role="tab" aria-selected="true">Knowledge Base</button>
+      <button class="tab-btn" data-panel="chat" role="tab" aria-selected="false">Assistant</button>
+    </nav>
+
+    <div class="status-cluster" id="status-cluster">
+      <span class="status-chip" id="status-qdrant" title="Qdrant vector store">
+        <i class="dot"></i> Vector store
+      </span>
+      <span class="status-chip" id="status-gemini" title="Gemini API">
+        <i class="dot"></i> Gemini
+      </span>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <!-- ============ DOCUMENTS PANEL ============ -->
+    <section class="panel documents-panel" id="panel-documents">
+
+      <div class="glass card kb-summary">
+        <div class="kb-stat">
+          <span class="kb-stat-value" id="stat-documents">0</span>
+          <span class="kb-stat-label">Documents</span>
+        </div>
+        <div class="kb-divider" aria-hidden="true"></div>
+        <div class="kb-stat">
+          <span class="kb-stat-value" id="stat-chunks">0</span>
+          <span class="kb-stat-label">Indexed chunks</span>
+        </div>
+      </div>
+
+      <div class="glass card upload-card">
+        <h2>Add to the knowledge base</h2>
+        <p class="muted">PDF, DOCX or TXT &middot; processed into searchable, cited chunks.</p>
+
+        <label class="dropzone" id="dropzone" for="file-input">
+          <input type="file" id="file-input" accept=".pdf,.docx,.txt" hidden>
+          <svg viewBox="0 0 24 24" width="28" height="28" class="dropzone-icon">
+            <path d="M12 4v11M12 4l-4 4M12 4l4 4M5 16v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"
+              fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="dropzone-text">Drop a document here, or <span class="link-text">browse</span></span>
+        </label>
+
+        <div class="upload-queue" id="upload-queue"></div>
+      </div>
+
+      <div class="glass card doc-list-card">
+        <h2>Documents</h2>
+        <div class="doc-list" id="doc-list">
+          <p class="empty-state" id="doc-empty">No documents yet &mdash; upload one to start building your knowledge base.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ CHAT PANEL ============ -->
+    <section class="panel chat-panel" id="panel-chat">
+      <div class="glass card chat-card">
+        <div class="chat-header">
+          <h2>Ask your knowledge base</h2>
+          <button class="ghost-btn" id="clear-chat">Clear conversation</button>
+        </div>
+
+        <div class="chat-scroll" id="chat-scroll">
+          <div class="chat-intro" id="chat-intro">
+            <p>Answers are grounded in your uploaded documents. Ask a question below and I'll cite exactly where the answer came from.</p>
+          </div>
+        </div>
+
+        <form class="chat-input-row" id="chat-form">
+          <textarea id="chat-input" placeholder="Ask a question about your documents..." rows="1"></textarea>
+          <button type="submit" class="send-btn" id="send-btn" aria-label="Send">
+            <svg viewBox="0 0 24 24" width="18" height="18">
+              <path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/>
+            </svg>
+          </button>
+        </form>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
